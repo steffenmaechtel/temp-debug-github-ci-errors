@@ -1,0 +1,80 @@
+name: dns-diag
+
+# One job, ~2-3 minutes: answers every open question about the GitHub
+# runner DNS breakage that kills apt inside docker builds (2026-11).
+# Questions, in order:
+#   Q1  Does the HOST resolve the archive domains right now?
+#   Q2  Which upstream servers does the host's systemd-resolved use?
+#   Q3  Which PUBLIC resolvers answer from the runner host? (also proves
+#       host-side apt works — dnsutils install)
+#   Q4  What resolv.conf does a BUILD container actually get (bridge)?
+#   Q5  ...and with --network=host? Does in-container resolution work?
+#   Q6  Does rewriting resolv.conf + RESTARTING docker fix the build?
+#       (dockerd/buildkitd may read resolv.conf only at startup — our
+#       rewrite in the kit's PR came after the daemon was up.)
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dns-diag-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  diag:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Q1+Q2 host resolver facts
+        run: |
+          echo "=== /etc/resolv.conf ==="
+          cat /etc/resolv.conf
+          echo "=== resolvectl: real upstream servers ==="
+          resolvectl status | grep -iE 'DNS Servers|DNS Domain' || echo "resolvectl grep empty"
+          echo "=== host getent probes ==="
+          getent hosts github.com >/dev/null && echo "host github.com: OK" || echo "host github.com: FAIL"
+          getent hosts archive.ubuntu.com >/dev/null && echo "host archive.ubuntu.com: OK" || echo "host archive.ubuntu.com: FAIL"
+          getent hosts azure.archive.ubuntu.com >/dev/null && echo "host azure.archive.ubuntu.com: OK" || echo "host azure.archive.ubuntu.com: FAIL"
+
+      - name: Q3 host queries against specific resolvers
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq dnsutils \
+            || echo "HOST APT FAILED (itself a data point)"
+          command -v nslookup >/dev/null || { echo "no nslookup, skipping"; exit 0; }
+          for srv in 168.63.129.16 1.1.1.1 8.8.8.8 9.9.9.9; do
+            echo "=== nslookup azure.archive.ubuntu.com @$srv ==="
+            timeout 10 nslookup azure.archive.ubuntu.com "$srv" 2>&1 | tail -6 || echo "NO ANSWER from $srv"
+          done
+
+      - name: Q4 build container resolver + resolution (bridge)
+        run: |
+          printf 'FROM mirror.gcr.io/library/ubuntu:24.04\nRUN cat /etc/resolv.conf && (getent hosts github.com && echo BRIDGE-RESOLVE-OK || echo BRIDGE-RESOLVE-FAIL)\n' \
+            > /tmp/Dockerfile.probe
+          docker build --no-cache -f /tmp/Dockerfile.probe -t probe:bridge /tmp
+
+      - name: Q5 build container resolver + resolution (host network)
+        run: |
+          printf 'FROM mirror.gcr.io/library/ubuntu:24.04\nRUN cat /etc/resolv.conf && (getent hosts github.com && echo HOSTNET-RESOLVE-OK || echo HOSTNET-RESOLVE-FAIL)\n' \
+            > /tmp/Dockerfile.probe
+          docker build --no-cache --network host -f /tmp/Dockerfile.probe -t probe:hostnet /tmp
+
+      - name: Q6 resolv.conf rewrite + docker restart, then rebuild
+        run: |
+          UPSTREAM="$(resolvectl status | grep -oP 'DNS Servers: \K.*' | grep . | head -1)"
+          echo "host upstream: ${UPSTREAM:-NONE}"
+          {
+            if [ -n "$UPSTREAM" ]; then printf 'nameserver %s\n' $UPSTREAM; fi
+            printf 'nameserver 168.63.129.16\nnameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 9.9.9.9\n'
+          } | sudo tee /etc/resolv.conf
+          cat /etc/resolv.conf
+          echo "=== restarting docker (buildkitd may cache resolv.conf at startup) ==="
+          sudo systemctl restart docker
+          sleep 3
+          printf 'FROM mirror.gcr.io/library/ubuntu:24.04\nRUN cat /etc/resolv.conf && (getent hosts archive.ubuntu.com && echo AFTER-RESTART-RESOLVE-OK || echo AFTER-RESTART-RESOLVE-FAIL)\n' \
+            > /tmp/Dockerfile.probe
+          docker build --no-cache --network host -f /tmp/Dockerfile.probe -t probe:restart /tmp
