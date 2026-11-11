@@ -1,0 +1,58 @@
+name: ppa-diag
+
+# Hotfix probe for the git-latest e2e leg: api.launchpad.net (what
+# add-apt-repository calls) timed out from the runners on 2026-11-11,
+# while the archive downloads themselves worked. The PPA package files
+# live on ppa.launchpadcontent.net (separate infra) and the signing key
+# on keyserver.ubuntu.com (also separate) — so the PPA can be wired
+# manually without ever touching the dead API. This run answers:
+#   Q-A  Are keyserver.ubuntu.com and ppa.launchpadcontent.net
+#        reachable from the runner host at all?
+#   Q-B  Does the OLD add-apt-repository path really fail? (expected
+#        FAIL; the job stays green and just records the evidence)
+#   Q-C  Does the NEW manual deb822 wiring install PPA git? apt-get
+#        update verifies the repo signature against the fetched key —
+#        a green update proves key and repo agree; git --version must
+#        then show the PPA version, not noble's 2.43.
+
+on:
+  push:
+    paths:
+      - '.github/workflows/ppa-diag.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ppa-diag-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  diag:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Q-A host reachability of the two PPA hosts
+        run: |
+          echo "=== keyserver.ubuntu.com pks lookup (key fingerprint header check) ==="
+          curl -fsSL --max-time 15 \
+            'https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xE1DD270288B4E6030699E45FA1715D88E1DF1F24' \
+            | head -3 || echo "KEYSERVER UNREACHABLE"
+          echo "=== ppa.launchpadcontent.net InRelease ==="
+          curl -sI --max-time 15 \
+            https://ppa.launchpadcontent.net/git-core/ppa/ubuntu/dists/noble/InRelease \
+            | head -3 || echo "LAUNCHPADCONTENT UNREACHABLE"
+
+      - name: Q-B old add-apt-repository path (expected FAIL, recorded)
+        run: |
+          printf 'FROM mirror.gcr.io/library/ubuntu:24.04\nRUN apt-get update -qq && apt-get install -y --no-install-recommends software-properties-common && timeout 90 add-apt-repository -y ppa:git-core/ppa && echo OLD-PATH-OK || echo OLD-PATH-FAIL-AS-EXPECTED\n' \
+            > /tmp/Dockerfile.ppa-old
+          docker build --no-cache -f /tmp/Dockerfile.ppa-old -t probe:ppa-old /tmp
+
+      - name: Q-C new manual deb822 path (expected PASS)
+        run: |
+          printf 'FROM mirror.gcr.io/library/ubuntu:24.04\nRUN apt-get update -qq && apt-get install -y --no-install-recommends curl ca-certificates && . /etc/os-release && mkdir -p /etc/apt/keyrings && printf "Types: deb\\nURIs: https://ppa.launchpadcontent.net/git-core/ppa/ubuntu\\nSuites: %s\\nComponents: main\\nSigned-By: /etc/apt/keyrings/git-core-ppa.asc\\n" "${VERSION_CODENAME}" > /etc/apt/sources.list.d/git-core-ppa.sources && curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xE1DD270288B4E6030699E45FA1715D88E1DF1F24" > /etc/apt/keyrings/git-core-ppa.asc && apt-get update -qq && apt-get install -y --no-install-recommends git && echo "=== PPA git installed:" && git --version\n' \
+            > /tmp/Dockerfile.ppa-new
+          docker build --no-cache -f /tmp/Dockerfile.ppa-new -t probe:ppa-new /tmp
